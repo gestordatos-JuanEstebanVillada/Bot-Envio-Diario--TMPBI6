@@ -1,0 +1,20 @@
+{
+  "name": "bot-envio-correo-diario-tmpbi6",
+  "version": "1.0.0",
+  "description": "Reporte diario de citas TMPBI6 desde Oracle hacia Gmail",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.16",
+    "oracledb": "^6.7.0"
+  }
+}
