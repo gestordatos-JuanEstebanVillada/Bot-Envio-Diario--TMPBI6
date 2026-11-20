@@ -1,6 +1,10 @@
+import fs from 'fs';
 import nodemailer from 'nodemailer';
 import path from 'path';
 import { reportDateToFileName } from './excel.js';
+
+const SEND_MAX_ATTEMPTS = 3;
+const SEND_RETRY_DELAY_MS = 2500;
 
 function escapeHtml(value) {
   if (value == null) return '';
@@ -20,6 +24,13 @@ function pick(row, ...keys) {
   return '';
 }
 
+export function parseEmailRecipients() {
+  return (process.env.EMAIL_TO || '')
+    .split(',')
+    .map((email) => email.trim())
+    .filter(Boolean);
+}
+
 function countBySpecialty(rows) {
   const counts = new Map();
   for (const row of rows) {
@@ -32,15 +43,49 @@ function countBySpecialty(rows) {
   );
 }
 
-function createTransporter() {
+async function getGmailAccessToken() {
+  const params = new URLSearchParams({
+    client_id: process.env.GMAIL_CLIENT_ID.trim(),
+    client_secret: process.env.GMAIL_CLIENT_SECRET.trim(),
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN.trim(),
+    grant_type: 'refresh_token',
+  });
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const detail = data.error_description || data.error || response.statusText;
+    throw new Error(
+      `No se pudo renovar el token OAuth2 de Gmail: ${detail}. Verifique que GMAIL_USER coincida con la cuenta que generó GMAIL_REFRESH_TOKEN.`
+    );
+  }
+
+  return data.access_token;
+}
+
+function createTransporter(accessToken) {
+  const user = process.env.GMAIL_USER.trim();
+
   return nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    connectionTimeout: 60_000,
+    greetingTimeout: 30_000,
+    socketTimeout: 120_000,
     auth: {
       type: 'OAuth2',
-      user: process.env.GMAIL_USER,
-      clientId: process.env.GMAIL_CLIENT_ID,
-      clientSecret: process.env.GMAIL_CLIENT_SECRET,
-      refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+      user,
+      clientId: process.env.GMAIL_CLIENT_ID.trim(),
+      clientSecret: process.env.GMAIL_CLIENT_SECRET.trim(),
+      refreshToken: process.env.GMAIL_REFRESH_TOKEN.trim(),
+      accessToken,
     },
   });
 }
@@ -59,6 +104,7 @@ function buildExecutiveSummaryHtml(rows, reportDate) {
   <h2 style="color: #1a5276; font-size: 18px;">Resumen ejecutivo — citas del día anterior</h2>
   <p><strong>Fecha del reporte:</strong> ${escapeHtml(reportDate)}</p>
   <p><strong>Total general de citas:</strong> 0</p>
+  <p>No hubo citas con estado <strong>P</strong> o <strong>T</strong> en esa fecha.</p>
   <p style="margin-top: 20px; padding: 12px; background-color: #f4f6f7; border-left: 4px solid #1a5276;">
     El detalle completo (sin registros) se encuentra en el archivo Excel adjunto: <strong>${escapeHtml(attachmentName)}</strong>.
   </p>
@@ -105,22 +151,38 @@ function buildExecutiveSummaryHtml(rows, reportDate) {
 </html>`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * @param {object[]} rows
  * @param {string} reportDate DD/MM/YYYY
  * @param {string} excelFilePath Ruta del .xlsx generado
  */
 export async function sendAppointmentsReport(rows, reportDate, excelFilePath) {
+  const destinatarios = parseEmailRecipients();
+
+  if (destinatarios.length === 0) {
+    const error = new Error(
+      'EMAIL_TO está vacío o no contiene correos válidos. Configure uno o más destinatarios separados por coma.'
+    );
+    console.error(`[mailer] ${error.message}`);
+    throw error;
+  }
+
+  if (!fs.existsSync(excelFilePath)) {
+    throw new Error(`No se encontró el archivo Excel adjunto: ${excelFilePath}`);
+  }
+
   const total = rows.length;
   const subject = `Reporte Diario de Citas - ${reportDate} (${total} registros)`;
   const html = buildExecutiveSummaryHtml(rows, reportDate);
   const attachmentFileName = path.basename(excelFilePath);
 
-  const transporter = createTransporter();
-
-  const info = await transporter.sendMail({
-    from: process.env.GMAIL_USER,
-    to: process.env.EMAIL_TO,
+  const mailOptions = {
+    from: process.env.GMAIL_USER.trim(),
+    to: destinatarios,
     subject,
     html,
     attachments: [
@@ -129,7 +191,39 @@ export async function sendAppointmentsReport(rows, reportDate, excelFilePath) {
         path: excelFilePath,
       },
     ],
-  });
+  };
 
-  return info;
+  let lastError;
+
+  for (let attempt = 1; attempt <= SEND_MAX_ATTEMPTS; attempt++) {
+    let transporter;
+
+    try {
+      const accessToken = await getGmailAccessToken();
+      transporter = createTransporter(accessToken);
+
+      const info = await transporter.sendMail(mailOptions);
+
+      console.log(
+        `[mailer] Correo enviado a ${destinatarios.join(', ')} (messageId: ${info.messageId})`
+      );
+
+      return { info, destinatarios };
+    } catch (err) {
+      lastError = err;
+      console.error(
+        `[mailer] Intento ${attempt}/${SEND_MAX_ATTEMPTS} fallido: ${err.message}`
+      );
+
+      if (attempt < SEND_MAX_ATTEMPTS) {
+        await sleep(SEND_RETRY_DELAY_MS * attempt);
+      }
+    } finally {
+      if (transporter) {
+        transporter.close();
+      }
+    }
+  }
+
+  throw lastError;
 }

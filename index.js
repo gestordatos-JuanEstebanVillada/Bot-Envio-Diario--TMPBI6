@@ -2,7 +2,10 @@ import 'dotenv/config';
 import cron from 'node-cron';
 import { fetchYesterdayAppointments } from './db.js';
 import { saveAppointmentsExcel } from './excel.js';
-import { sendAppointmentsReport } from './mailer.js';
+import {
+  parseEmailRecipients,
+  sendAppointmentsReport,
+} from './mailer.js';
 
 const TIMEZONE = process.env.TIMEZONE || 'America/Bogota';
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 7 * * *';
@@ -56,10 +59,14 @@ async function runDailyReport(trigger = 'manual') {
     log(`Excel guardado: ${excelPath}`);
 
     log('Enviando correo con resumen ejecutivo y adjunto…');
-    const info = await sendAppointmentsReport(rows, reportDate, excelPath);
+    const { info, destinatarios } = await sendAppointmentsReport(
+      rows,
+      reportDate,
+      excelPath
+    );
 
     log(
-      `Correo enviado correctamente a ${process.env.EMAIL_TO} (messageId: ${info.messageId})`
+      `Correo enviado correctamente a ${destinatarios.join(', ')} (messageId: ${info.messageId})`
     );
   } catch (err) {
     log(`Error en el proceso de reporte: ${err.message}`, 'ERROR');
@@ -83,12 +90,21 @@ function validateEnv() {
     'EMAIL_TO',
   ];
 
-  const missing = required.filter((key) => !process.env[key]);
+  const missing = required.filter((key) => !process.env[key]?.trim());
   if (missing.length > 0) {
     throw new Error(
       `Variables de entorno faltantes: ${missing.join(', ')}`
     );
   }
+
+  const destinatarios = parseEmailRecipients();
+  if (destinatarios.length === 0) {
+    throw new Error(
+      'EMAIL_TO debe contener al menos un correo válido (separados por coma si son varios).'
+    );
+  }
+
+  log(`Destinatarios configurados: ${destinatarios.join(', ')}`);
 }
 
 async function main() {
